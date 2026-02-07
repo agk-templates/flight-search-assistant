@@ -1,10 +1,10 @@
 # Flight Search Assistant (AGK Template)
 
-Config-driven flight search workflow with a mock tool.
+Config-driven flight search workflow using the Amadeus API.
 
 ## What it does
 1) Extracts search constraints
-2) Calls a mock `flight_search` tool
+2) Calls the `flight_search` tool (Amadeus API)
 3) Summarizes results
 
 ## How it works
