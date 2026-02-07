@@ -1,0 +1,37 @@
+[workflow]
+name = "flight-search-assistant"
+mode = "sequential"
+timeout = "180s"
+
+[workflow.llm]
+provider = "{{ .LLMProvider }}"
+model = "{{ .LLMModel }}"
+max_tokens = 2000
+http_timeout = "180s"
+
+[[workflow.agent_defs]]
+name = "planner"
+system_prompt = '''__PROMPT_PLANNER__'''
+temperature = 0.3
+
+[[workflow.agent_defs]]
+name = "searcher"
+system_prompt = '''__PROMPT_SEARCHER__'''
+temperature = 0.2
+
+[[workflow.agent_defs]]
+name = "summarizer"
+system_prompt = '''__PROMPT_SUMMARIZER__'''
+temperature = 0.4
+
+[[workflow.step_defs]]
+name = "plan"
+agent = "planner"
+
+[[workflow.step_defs]]
+name = "search"
+agent = "searcher"
+
+[[workflow.step_defs]]
+name = "summarize"
+agent = "summarizer"

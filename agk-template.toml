@@ -1,0 +1,17 @@
+[template]
+name = "flight-search-assistant"
+version = "0.1.0"
+description = "Config-driven flight search assistant with mock tool"
+author = "AgenticGoKit"
+license = "MIT"
+min_agk_version = "0.1.0"
+
+[template.variables]
+project_description = { type = "string", description = "Project description", default = "Flight search assistant" }
+
+[template.files]
+include = ["**/*"]
+exclude = [".git", "agk-template.toml"]
+
+[template.hooks]
+post_create = ["go mod tidy"]

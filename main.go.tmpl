@@ -1,0 +1,224 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/BurntSushi/toml"
+	_ "github.com/agenticgokit/agenticgokit/plugins/llm/anthropic"
+	_ "github.com/agenticgokit/agenticgokit/plugins/llm/ollama"
+	_ "github.com/agenticgokit/agenticgokit/plugins/llm/openai"
+	agk "github.com/agenticgokit/agenticgokit/v1beta"
+	_ "{{ .ProjectName }}/tools"
+)
+
+const (
+	workflowConfigFile = "workflow.toml"
+	promptsDir          = "prompts"
+)
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+
+	processedConfig, err := prepareWorkflowConfig(workflowConfigFile)
+	if err != nil {
+		log.Fatalf("Failed to prepare workflow config: %v", err)
+	}
+
+	workflow, err := loadWorkflowWithTools(processedConfig)
+	if err != nil {
+		log.Fatalf("Failed to load workflow: %v", err)
+	}
+
+	if err := workflow.Initialize(ctx); err != nil {
+		log.Fatalf("Failed to initialize workflow: %v", err)
+	}
+	defer workflow.Shutdown(ctx)
+
+	input := os.Getenv("INPUT_TEXT")
+	if input == "" {
+		input = "Find flights from SFO to JFK on 2026-03-15, return 2026-03-20, 1 adult, economy, max $600."
+	}
+
+	fmt.Println("Streaming flight search...\n")
+	stream, err := workflow.RunStream(ctx, input)
+	if err != nil {
+		log.Fatalf("Failed to start workflow: %v", err)
+	}
+
+	for chunk := range stream.Chunks() {
+		if chunk.Error != nil {
+			fmt.Printf("\nError: %v\n", chunk.Error)
+			break
+		}
+
+		switch chunk.Type {
+		case agk.ChunkTypeAgentStart:
+			if stepName, ok := chunk.Metadata["step_name"].(string); ok {
+				fmt.Printf("\n[Step: %s]\n", stepName)
+			}
+		case agk.ChunkTypeDelta:
+			fmt.Print(chunk.Delta)
+		case agk.ChunkTypeAgentComplete:
+			if stepName, ok := chunk.Metadata["step_name"].(string); ok {
+				fmt.Printf("\n[Completed: %s]\n", stepName)
+			}
+		}
+	}
+
+	result, err := stream.Wait()
+	if err != nil {
+		log.Fatalf("Workflow failed: %v", err)
+	}
+
+	fmt.Printf("\n\nCompleted in %v\n", result.Duration)
+}
+
+func prepareWorkflowConfig(path string) (string, error) {
+	configBytes, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+
+	plannerPrompt, err := loadPrompt("planner.system.txt")
+	if err != nil {
+		return "", err
+	}
+
+	searcherPrompt, err := loadPrompt("searcher.system.txt")
+	if err != nil {
+		return "", err
+	}
+
+	summarizerPrompt, err := loadPrompt("summarizer.system.txt")
+	if err != nil {
+		return "", err
+	}
+
+	processed := string(configBytes)
+	processed = strings.ReplaceAll(processed, "__PROMPT_PLANNER__", plannerPrompt)
+	processed = strings.ReplaceAll(processed, "__PROMPT_SEARCHER__", searcherPrompt)
+	processed = strings.ReplaceAll(processed, "__PROMPT_SUMMARIZER__", summarizerPrompt)
+
+	tempFile, err := os.CreateTemp("", "agk-workflow-*.toml")
+	if err != nil {
+		return "", err
+	}
+	defer tempFile.Close()
+
+	if _, err := tempFile.WriteString(processed); err != nil {
+		return "", err
+	}
+
+	return tempFile.Name(), nil
+}
+
+func loadPrompt(filename string) (string, error) {
+	path := fmt.Sprintf("%s/%s", promptsDir, filename)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+
+	prompt := strings.TrimSpace(string(data))
+	if strings.Contains(prompt, "'''") {
+		return "", fmt.Errorf("prompt contains TOML literal string terminator (''')")
+	}
+	return prompt, nil
+}
+
+func loadWorkflowWithTools(configPath string) (agk.Workflow, error) {
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("configuration file not found: %s", configPath)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read configuration file %s: %w", configPath, err)
+	}
+
+	var projectConfig agk.ProjectConfig
+	if err := toml.Unmarshal(data, &projectConfig); err != nil {
+		return nil, fmt.Errorf("failed to parse TOML configuration: %w", err)
+	}
+
+	if projectConfig.Workflow.Mode == "" {
+		return nil, fmt.Errorf("no workflow configuration found in %s (workflow.mode must be set)", configPath)
+	}
+
+	workflow, err := agk.NewWorkflow(&projectConfig.Workflow)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create workflow: %w", err)
+	}
+
+	agentMap := make(map[string]agk.Agent)
+	for _, agentDef := range projectConfig.Workflow.AgentDefs {
+		var opts []agk.Option
+
+		if agentDef.SystemPrompt != "" {
+			opts = append(opts, agk.WithSystemPrompt(agentDef.SystemPrompt))
+		}
+
+		if projectConfig.Workflow.LLM != nil {
+			llmConfig := projectConfig.Workflow.LLM
+			temperature := agentDef.Temperature
+			if temperature == 0 {
+				temperature = float64(llmConfig.Temperature)
+			}
+			maxTokens := agentDef.MaxTokens
+			if maxTokens == 0 {
+				maxTokens = llmConfig.MaxTokens
+			}
+
+			opts = append(opts, func(c *agk.Config) {
+				c.LLM.Provider = llmConfig.Provider
+				c.LLM.Model = llmConfig.Model
+				c.LLM.Temperature = float32(temperature)
+				c.LLM.MaxTokens = maxTokens
+				c.LLM.BaseURL = llmConfig.BaseURL
+				c.LLM.HTTPTimeout = llmConfig.HTTPTimeout
+			})
+		}
+
+		if agentDef.Name == "searcher" {
+			opts = append(opts, func(c *agk.Config) {
+				c.Tools = &agk.ToolsConfig{
+					Enabled: true,
+					Timeout: 30 * time.Second,
+					MaxRetries: 2,
+				}
+			})
+		}
+
+		agent, err := agk.NewChatAgent(agentDef.Name, opts...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create agent %s: %w", agentDef.Name, err)
+		}
+
+		agentMap[agentDef.Name] = agent
+	}
+
+	for _, stepDef := range projectConfig.Workflow.StepDefs {
+		agent, ok := agentMap[stepDef.Agent]
+		if !ok {
+			return nil, fmt.Errorf("step %s references undefined agent %s", stepDef.Name, stepDef.Agent)
+		}
+
+		step := agk.WorkflowStep{
+			Name:         stepDef.Name,
+			Agent:        agent,
+			Dependencies: stepDef.DependsOn,
+		}
+
+		if err := workflow.AddStep(step); err != nil {
+			return nil, fmt.Errorf("failed to add step %s: %w", stepDef.Name, err)
+		}
+	}
+
+	return workflow, nil
+}
